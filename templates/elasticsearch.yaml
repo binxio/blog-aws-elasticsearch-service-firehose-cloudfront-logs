@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: aws-es-firehose-apigw-access-logs
+
+Resources:
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${RandomName}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Function: !GetAtt NotificationLambda.Arn
+          Event: s3:ObjectCreated:*
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotificationLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${RandomName}'
+
+  RandomName:
+    Type: Custom::RandomNameGenerator
+    Properties:
+      ServiceToken: !GetAtt 'RandomNameGenerator.Arn'
+
+  RandomNameGenerator:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt 'LambdaBasicExecutionRole.Arn'
+      Runtime: python3.6
+      Code:
+        ZipFile: |
+          import string
+          import random
+          import cfnresponse
+          def lambda_handler(event, context):
+              if event['RequestType'] == 'Create':
+                  event['PhysicalResourceId'] = ''.join(random.choice(string.ascii_lowercase) for _ in range(16))
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event['PhysicalResourceId'])
+
+  NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BucketEventHandler
+      Handler: index.handler
+      Runtime: python3.6
+      Timeout: 60
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+      Environment:
+        Variables:
+          DELIVERY_STREAM_NAME: !Ref Deliverystream
+      Code:
+        ZipFile: |+
+          import boto3
+          import json
+          import os
+          from base64 import b64encode
+
+          s3 = boto3.resource('s3')
+          firehose = boto3.client('firehose')
+
+          delivery_stream_name = os.environ['DELIVERY_STREAM_NAME']
+
+          def process_line(line: str):
+              record = line.strip('\n').split('\t')
+              return {
+                  'date': record[0],
+                  'time': record[1],
+                  'x-edge-location': record[2],
+                  'sc-bytes': record[3],
+                  'c-ip': record[4],
+                  'cs-method': record[5],
+                  'cs-host': record[6],
+                  'cs-uri-stem': record[7],
+                  'sc-status': record[8],
+                  'cs-referer': record[9],
+                  'cs-user-agent': record[10],
+                  'cs-uri-query': record[11],
+                  'cs-cookie': record[12],
+                  'x-edge-result-type': record[13],
+                  'x-edge-request-id': record[14],
+                  'x-host-header': record[15],
+                  'cs-protocol': record[16],
+                  'cs-bytes': record[17],
+                  'time-taken': record[18],
+                  'x-forwarded-for': record[19],
+                  'ssl-protocol': record[20],
+                  'ssl-cipher': record[21],
+                  'x-edge-response-result-type': record[22],
+                  'cs-protocol-version': record[23],
+                  'fle-status': record[24],
+                  'fle-encrypted-fields': record[25]
+              }
+
+          def filter_lines(lines: [str]) -> [str]:
+              return list(filter(lambda line: not line.startswith('#'), lines))
+
+          def publish(batch: [dict]) -> None:
+              assert len(batch) <= 500
+              data = []
+              for log in batch:
+                  encoded = bytes(json.dumps(log), 'utf-8')
+                  data.append({'Data': encoded})
+
+              print(f'Publishing to {delivery_stream_name} data: {data}')
+              firehose.put_record_batch(DeliveryStreamName=delivery_stream_name, Records=data)
+
+          def handler(event, ctx):
+              counter = 0
+              batch: [dict] = []
+              bucket_event = event['Records'][0]
+              if bucket_event['eventName'] == 'ObjectCreated:Put':
+                  bucket = bucket_event['s3']['bucket']['name']
+                  key = bucket_event['s3']['object']['key']
+                  obj = s3.Object(bucket, key)
+                  for line in obj.get()['Body'].read().splitlines():
+                      text: str = line.decode('utf-8')
+                      if not text.startswith('#'):
+                          if counter < 500:
+                              batch.append(process_line(text))
+                              counter += 1
+                          else:
+                              publish(batch)
+                              batch = []
+                              counter = 0
+
+                  if counter is not 0:
+                      publish(batch)
+
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Python Function Handler
+      Handler: index.handler
+      Runtime: python3.6
+      Timeout: 60
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from base64 import b64encode, b64decode
+          import json
+
+          def handler(event, context):
+          	records = event['records']
+          	for record in records:
+          		record.pop('approximateArrivalTimestamp', None)
+          		print(f"decoded: '{b64decode(record['data']).decode('utf8')}'")
+          		record.update({'result': 'Ok'}) # Ok, Dropped, ProcessingFailed
+          	print(json.dumps(records))
+          	return {'records': records}
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  DeliverystreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: firehose.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      Policies:
+      - PolicyName: Allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            - kms:*
+            - kinesis:*
+            - logs:*
+            - lambda:*
+            - es:*
+            Resource:
+            - '*'
+
+  Deliverystream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ElasticsearchDestinationConfiguration:
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: example-firehose
+          LogStreamName: example-firehose
+        DomainARN: !GetAtt ElasticsearchDomain.DomainArn
+        IndexName: example
+        IndexRotationPeriod: OneHour # NoRotation, OneHour, OneDay, OneWeek, or OneMonth.
+        RetryOptions:
+          DurationInSeconds: 60
+        RoleARN: !GetAtt DeliverystreamRole.Arn
+        S3BackupMode: AllDocuments
+        S3Configuration:
+          BucketARN: !GetAtt DestinationBucket.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+          CompressionFormat: UNCOMPRESSED
+          RoleARN: !GetAtt DeliverystreamRole.Arn
+        TypeName: example
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Type: Lambda
+            Parameters:
+            - ParameterName: LambdaArn
+              ParameterValue: !GetAtt ProcessorFunction.Arn
+            - ParameterName: RoleArn
+              ParameterValue: !GetAtt DeliverystreamRole.Arn
+            - ParameterName: NumberOfRetries
+              ParameterValue: '3'
+            - ParameterName: BufferSizeInMBs
+              ParameterValue: '1'
+            - ParameterName: BufferIntervalInSeconds
+              ParameterValue: '60'
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: example-firehose
+      RetentionInDays: 30
+  CloudWatchLogStream:
+    Type: AWS::Logs::LogStream
+    DependsOn:
+    - CloudWatchLogGroup
+    Properties:
+      LogGroupName: example-firehose
+      LogStreamName: example-firehose
+  LamdaCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProcessorFunction}
+      RetentionInDays: 30
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      ElasticsearchVersion: '6.3'
+      ElasticsearchClusterConfig:
+        InstanceCount: '1'
+        InstanceType: t2.small.elasticsearch
+      EBSOptions:
+        EBSEnabled: 'true'
+        Iops: 0
+        VolumeSize: 10
+        VolumeType: gp2
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: '0'
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action: es:*
+          Resource: '*'
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+
+Outputs:
+  KinesisStreamName:
+    Description: The name of the Deliverystream
+    Value: !Ref Deliverystream
+  KinesisStreamArn:
+    Description: The arn of the Deliverystream
+    Value: !GetAtt Deliverystream.Arn
+  BucketName:
+    Description: The name of the DestinationBucket
+    Value: !Ref DestinationBucket
+  LogBucketName:
+    Value: !Ref LogBucket

@@ -1,0 +1,38 @@
+{
+  "Records": [
+    {
+      "eventVersion": "2.0",
+      "eventSource": "aws:s3",
+      "awsRegion": "eu-west-1",
+      "eventTime": "2018-11-18T12:42:15.922Z",
+      "eventName": "ObjectCreated:Put",
+      "userIdentity": {
+        "principalId": "AWS:AIDAJSZKO5A3SBJFMYXTE"
+      },
+      "requestParameters": {
+        "sourceIPAddress": "217.19.26.243"
+      },
+      "responseElements": {
+        "x-amz-request-id": "B9CC7E95824DAC64",
+        "x-amz-id-2": "qufqqLvaJ4w7e9UwHdBply4jPEJhwJXbL5qYr0fbhAtZPn0+lfixoN26JC/80uBGpHPxbvDL9XM="
+      },
+      "s3": {
+        "s3SchemaVersion": "1.0",
+        "configurationId": "8450cff2-771d-4a5f-9599-255bc97cbd47",
+        "bucket": {
+          "name": "qmuixbpinyhhlwpd",
+          "ownerIdentity": {
+            "principalId": "A97CX0CDO58US"
+          },
+          "arn": "arn:aws:s3:::qmuixbpinyhhlwpd"
+        },
+        "object": {
+          "key": "README.md",
+          "size": 215,
+          "eTag": "2e59fd3b13286947aa9d4dcaa03bf568",
+          "sequencer": "005BF15E27DB726B35"
+        }
+      }
+    }
+  ]
+}
